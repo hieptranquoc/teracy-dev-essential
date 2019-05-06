@@ -1,26 +1,28 @@
 require 'teracy-dev/config/configurator'
 require 'teracy-dev/plugin'
-
+require 'teracy-dev/util'
 
 module TeracyDevEssential
   module Config
     class RsyncRecovery < TeracyDev::Config::Configurator
 
       def configure_common(settings, config)
-        # The trigger is only supported by vagrant version >= 2.2.0
-        require_version = ">= 2.2.0"
-        vagrant_version = Vagrant::VERSION
 
-        unless TeracyDev::Util.require_version_valid?(vagrant_version, require_version)
-          @logger.warn("gatling-rsync-auto recovery is only supported by vagrant version `#{require_version}`")
-          return
-        end
-
-        if gatling_rsync_installed?
-          config.gatling.rsync_on_startup = false
-        end
+        return if !gatling_rsync_installed?
 
         plugins = settings['vagrant']['plugins'] ||= []
+
+        valid_command(plugins)
+
+        config.gatling.rsync_on_startup = false
+
+        @vagrant_version = Vagrant::VERSION
+
+        unless TeracyDev::Util.require_version_valid?(@vagrant_version, ">= 2.2.0")
+          @logger.warn("vagrant current version: #{@vagrant_version}")
+          @logger.warn("rsync auto recovery is only supported by vagrant version `>= 2.2.0`, please upgrade vagrant")
+          return
+        end
 
         return unless can_proceed?(plugins)
 
@@ -34,6 +36,17 @@ module TeracyDevEssential
       def configure_node(settings, config)
         return if settings['name'] != @last_node
 
+        @cmd = 'gatling-rsync-auto'
+
+        if Vagrant::Util::Platform.linux?
+          if TeracyDev::Util.require_version_valid?(@vagrant_version, ">= 2.2.3")
+            @cmd = 'rsync-auto'
+
+          else
+            @logger.warn("a bug related to syncing created files will be fixed by vagrant >= 2.2.3, please upgrade vagrant")
+          end
+        end
+
         configure_trigger_after(config)
       end
 
@@ -43,17 +56,17 @@ module TeracyDevEssential
       def can_proceed?(plugins)
         return false if plugins.empty?
 
-        plugin = plugins.select { |item| item['name'] == 'vagrant-gatling-rsync' }.first
+        plugin = plugins.select { |item| item['name'] == 'vagrant-gatling-rsync' and TeracyDev::Util.true? item['enabled'] }.first
 
-        if gatling_rsync_installed?
+        if plugin
           rsync_on_startup = plugin['options']['rsync_on_startup']
 
           unless TeracyDev::Util.exist? rsync_on_startup
             rsync_on_startup = true
           end
 
-          return true if TeracyDev::Util.true?(plugin['enabled']) and TeracyDev::Util.true?(rsync_on_startup)
-        end if plugin
+          return true if TeracyDev::Util.true?(rsync_on_startup)
+        end
 
         return false
       end
@@ -92,16 +105,56 @@ module TeracyDevEssential
         return false
       end
 
+      # check if run gatling-rsync-auto command
+      def valid_command(plugins)
+        gatling_cmd = ARGV.any? { |s| s.include?('gatling-rsync-auto') }
+
+        if gatling_cmd
+          gatling_plugin_enabled = plugins.select { |item| item['name'] == 'vagrant-gatling-rsync' and TeracyDev::Util.true? item['enabled'] }
+
+          if gatling_plugin_enabled.empty?
+            @logger.error("vagrant-gatling-rsync plugin must be enabled, and use 'vagrant up' instead of 'vagrant gatling-rsync-auto'")
+            abort
+          else
+            @logger.warn("'vagrant gatling-rsync-auto' does support rsync recovery, will use 'vagrant up' instead")
+
+            exec "vagrant up"
+          end
+        end
+
+        rsync_cmd = ARGV.any? { |s| s.include?('rsync-auto') }
+
+        if rsync_cmd and TeracyDev::Util.require_version_valid?(Vagrant::VERSION, "< 2.2.3")
+          @logger.warn("'vagrant rsync-auto' does support rsync recovery, will use 'vagrant up' instead")
+
+          exec "vagrant up"
+        end
+      end
+
       def configure_trigger_after(config)
         config.trigger.after :up, :reload, :resume do |trigger|
           trigger.ruby do |env, machine|
-            begin
-              env.cli('gatling-rsync-auto')
-              raise unless $?.exitstatus == 0
-            rescue
-              @logger.warn('gatling-rsync-auto crashed, retrying...')
-              retry
+            ready = machine.guest.ready?
+
+            unless ready
+              @logger.error("guest machine is not ready")
+              abort
             end
+
+            if @cmd == 'rsync-auto'
+              env.cli(@cmd)
+            else
+              begin
+                env.cli(@cmd)
+
+                raise unless $?.exitstatus == 0
+              rescue
+                @logger.warn('gatling-rsync-auto crashed, retrying...')
+
+                retry
+              end
+            end
+
           end
         end
       end
